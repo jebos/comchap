@@ -6,8 +6,10 @@ unset LD_LIBRARY_PATH
 
 exitcode=0
 
-ffmpegPath="ffmpeg"
+ffmpegPath="avconv"
 comskipPath="comskip"
+ffprobePath="avprobe"
+jqPath="jq"
 
 if [[ $# -lt 1 ]]; then
 
@@ -30,11 +32,17 @@ deletelogo=true
 deletetxt=true
 lockfile=""
 workdir=""
+extension="ts"
+onlyConcat=false
 
 while [[ $# -gt 1 ]]
 do
 key="$1"
 case $key in
+    --extension=*)
+    extension="${key#*=}"
+    shift
+    ;;
     --keep-edl)
     deleteedl=false
     shift
@@ -63,6 +71,10 @@ case $key in
     workdir="${key#*=}"
     shift
     ;;
+    --only-concat)
+    onlyConcat=true
+    shift
+    ;;
     *)
     break
     ;;
@@ -88,17 +100,18 @@ elif ! grep -q "output_edl=1" "$comskipini"; then
 fi
 
 infile=$1
-outfile=$infile
+outfile="processed.$infile"
 
 if [[ -z "$2" ]]; then
-  outfile="$infile"
+  outfile="processed.$infile"
 else
   outfile="$2"
 fi
 
-outdir=$(dirname "$outfile")
+outdir="$(dirname "$outfile")"
 
 outextension="${outfile##*.}"
+extension=$outextension
 comskipoutput=""
 
 if [[ ! -z "$workdir" ]]; then
@@ -119,6 +132,9 @@ logofile="$workdir${infile%.*}.logo.txt"
 txtfile="$workdir${infile%.*}.txt"
 
 
+if [ ! -f "$metafile" ]; then
+  onlyConcat=false
+fi
 
 if [ ! -f "$edlfile" ]; then
   $comskipPath $comskipoutput --ini="$comskipini" "$infile"
@@ -133,11 +149,36 @@ concat=""
 tempfiles=()
 totalcutduration=0
 
-echo ";FFMETADATA1" > "$metafile"
+numberOfAudioStreams=`$ffprobePath -v error -select_streams a -show_entries stream=index -of json=c=0 "$infile"  | $jqPath -r '.streams | length'`
+numberOfSubtitleStreams=`$ffprobePath -v error -select_streams s -show_entries stream=index -of json=c=0 "$infile"  | $jqPath -r '.streams | length'`
+
+audio=""
+
+subtitle=""
+
+for audioStream in $(seq 1 $numberOfAudioStreams)
+do
+  internalASNB=$(($audioStream-1))
+  streamChannels=`$ffprobePath -v error -select_streams a:$internalASNB -show_entries stream=channels -of json=c=0 "$infile" | $jqPath -r '.streams[] | "\(.channels)"'`
+
+  if [ $streamChannels -ne 0 ]; then
+    audio="$audio -acodec copy -map a:$internalASNB"
+  fi
+done
+  
+if [ $numberOfSubtitleStreams -gt 0 ]; then
+  subtitle="-scodec copy -map s:0"
+fi
+
+if ! $onlyConcat; then
+  echo ";FFMETADATA1" > "$metafile"
+else
+  echo "ONLY CONCAT!"
+fi
+
 # Reads in from $edlfile, see end of loop.
 while IFS=$'\t' read -r -a line
 do
-
   end="${line[0]}"
   startnext="${line[1]}"
 
@@ -145,14 +186,14 @@ do
     ((i++))
 
     hascommercials=true
-
-    echo [CHAPTER] >> "$metafile"
-    echo TIMEBASE=1/1000 >> "$metafile"
-    echo START=`echo "$start  $totalcutduration" | awk  '{printf "%i", ($1 - $2) * 1000}'` >> "$metafile"
-    echo END=`echo "$end $totalcutduration" | awk  '{printf "%i", ($1 - $2) * 1000}'` >> "$metafile"
-    echo "title=Chapter $i" >> "$metafile"
-
-    chapterfile="${infile%.*}.part-$i.ts"
+    if ! $onlyConcat; then
+      echo [CHAPTER] >> "$metafile"
+      echo TIMEBASE=1/1000 >> "$metafile"
+      echo START=`echo "$start  $totalcutduration" | awk  '{printf "%i", ($1 - $2) * 1000}'` >> "$metafile"
+      echo END=`echo "$end $totalcutduration" | awk  '{printf "%i", ($1 - $2) * 1000}'` >> "$metafile"
+      echo "title=Chapter $i" >> "$metafile"
+    fi
+    chapterfile="${infile%.*}.part-$i.$extension"
 
     if [[ ! -z "$workdir" ]]; then
       chapterfile=`basename "$chapterfile"`
@@ -160,11 +201,18 @@ do
     fi
 
     tempfiles+=("$chapterfile")
-    concat="$concat|$chapterfile"
+    #concat="$concat|$chapterfile"
+    if [ "$extension" == "mkv" ]; then
+       concat="$concat + $chapterfile"
+    else
+       concat="$concat|$chapterfile"
+    fi
 
     duration=`echo "$end" "$start" | awk  '{printf "%f", $1 - $2}'`
-    $ffmpegPath -hide_banner -loglevel error -nostdin -i "$infile" -ss "$start" -t "$duration" -c copy -y "$chapterfile"
-
+    if ! $onlyConcat; then
+      echo "$ffmpegPath -fix_sub_duration -ignore_unknown -hide_banner -loglevel error -nostdin -analyzeduration 50000000 -probesize 50000000 -i \"$infile\" -ss "$start" -t \"$duration\" -vcodec copy -map v:0  $audio $szbtitle -y \"$chapterfile\""
+      $ffmpegPath -fix_sub_duration -ignore_unknown -hide_banner -loglevel error -nostdin -analyzeduration 50000000 -probesize 50000000 -i "$infile" -ss "$start" -t "$duration"  -vcodec copy -map v:0 $audio $subtitle  -y "$chapterfile"
+    fi
     totalcutduration=`echo "$totalcutduration" "$startnext" "$end" | awk  '{print $1 + $2 - $3}'`
 
   fi
@@ -172,41 +220,60 @@ do
   start=$startnext
 done < "$edlfile"
 
+echo "$hascommercials"
+
 if $hascommercials ; then
 
-  #dont forget to add the final part from last commercial to end of file
-  end=`$ffmpegPath -hide_banner -nostdin -i "$infile" 2>&1 | grep Duration | awk '{print $2}' | tr -d , | awk -F: '{ printf "%f", ($1*3600)+($2*60)+$3 }'`
-
+  if ! $onlyConcat; then
+    #dont forget to add the final part from last commercial to end of file
+    end=`$ffmpegPath -hide_banner -nostdin -i "$infile" 2>&1 | grep Duration | awk '{print $2}' | tr -d , | awk -F: '{ printf "%f", ($1*3600)+($2*60)+$3 }'`
+  fi
   if [ `echo "$end" | awk '{printf "%i", $0 * 1000}'` -gt `echo "$start" | awk '{printf "%i", $0 * 1000}'` ]; then
 
     ((i++))
-
-    echo [CHAPTER] >> "$metafile"
-    echo TIMEBASE=1/1000 >> "$metafile"
-    echo START=`echo "$start  $totalcutduration" | awk  '{printf "%i", ($1 - $2) * 1000}'` >> "$metafile"
-    echo END=`echo "$end $totalcutduration" | awk  '{printf "%i", ($1 - $2) * 1000}'` >> "$metafile"
-    echo "title=Chapter $i" >> "$metafile"
-
-    chapterfile="${infile%.*}.part-$i.ts"
+    if ! $onlyConcat; then
+      echo [CHAPTER] >> "$metafile"
+      echo TIMEBASE=1/1000 >> "$metafile"
+      echo START=`echo "$start  $totalcutduration" | awk  '{printf "%i", ($1 - $2) * 1000}'` >> "$metafile"
+      echo END=`echo "$end $totalcutduration" | awk  '{printf "%i", ($1 - $2) * 1000}'` >> "$metafile"
+      echo "title=Chapter $i" >> "$metafile"
+    fi
+    chapterfile="${infile%.*}.part-$i.$extension"
 
     if [[ ! -z "$workdir" ]]; then
       chapterfile=`basename "$chapterfile"`
-      chapterfile="$workdir$chapterfile"
+      chapterfile="$chapterfile"
     fi
 
     tempfiles+=("$chapterfile")
-    concat="$concat|$chapterfile"
+    if [ "$extension" == "mkv" ]; then
+       concat="$concat + $chapterfile"
+    else
+       concat="$concat|$chapterfile"
+    fi
 
     duration=`echo "$end" "$start" | awk  '{printf "%f", $1 - $2}'`
-    $ffmpegPath -hide_banner -loglevel error -nostdin -i "$infile" -ss "$start" -t "$duration" -c copy -y "$chapterfile"
+    if ! $onlyConcat; then
+      $ffmpegPath -fix_sub_duration -ignore_unknown -hide_banner -loglevel error -nostdin -i "$infile" -ss "$start" -t "$duration"  -vcodec copy -map v:0 $audio $subtitle -y "$chapterfile"
+    fi
   fi
-
-  $ffmpegPath -hide_banner -loglevel error -nostdin -i "$metafile" -i "concat:${concat:1}" -c copy -map_metadata 0 -y "$outfile"
+  echo "$ffmpegPath -fix_sub_duration -ignore_unknown -hide_banner -loglevel error -nostdin -i \"concat:${concat:1}\" -i "$metafile" -map 1? -vcodec copy -map v:0 $audio $subtitle -y $outfile" 
+  if [ "$extension" == "mkv" ]; then
+    echo "mkvmerge -o \"$outfile\" ${concat:3}"
+    #TODO: this seems to mix up things... needs more testing
+    mkvmerge -o "$outfile" ${concat:3}
+  else
+    echo "$ffmpegPath -fix_sub_duration -ignore_unknown -hide_banner -loglevel error -nostdin -i \"concat:${concat:1}\" -i "$metafile" -map 1?  -vcodec copy -map v:0 $audio $subtitle -y $outfile"
+    $ffmpegPath -fix_sub_duration -ignore_unknown -hide_banner -loglevel error -nostdin -i "concat:${concat:1}" -i "$metafile" -map_metadata 1 -vcodec copy -map v:0 $audio $subtitle -y "$outfile"
+  fi
+  #./transcodeToMp4.sh "$outfile"
 fi
 
 for i in "${tempfiles[@]}"
 do
-  rm "$i"
+  if $deletemeta ; then
+    rm "$i"
+  fi
 done
 
 if $deleteedl ; then
