@@ -8,6 +8,11 @@ exitcode=0
 ffmpegPath="ffmpeg"
 ffprobePath="avprobe"
 
+command -v $ffmpegPath >/dev/null 2>&1 || { echo >&2 "I require $ffmpegPath but it's not installed.  Aborting."; exit 1; }
+command -v $ffprobePath >/dev/null 2>&1 || { echo >&2 "I require $ffprobePath but it's not installed.  Aborting."; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo >&2 "I require foo bujq but's not installed.  Aborting."; exit 1; }
+command -v bc >/dev/null 2>&1 || { echo >&2 "I require bc but it's not installed.  Aborting."; exit 1; }
+
 if [[ $# -lt 1 ]]; then
 
   exename=$(basename "$0")
@@ -15,12 +20,20 @@ if [[ $# -lt 1 ]]; then
   echo "Converts ts or mkv to mp4 keeping subtitles and all audio, audio is converted (mp2->acc, ac3 -> acc)"
   echo ""
   echo "Usage: $exename infile"
+  echo "Options:"
+  echo " --dry-run       Do not convert, only print command"
+  echo " --start-second  Provide start point in seconds"
+  echo " --end-second    Povide end point in seconds (NOT duration, seconds from start of original source)"
+  echo " --start-time    Time in format 00:00:00"
+  echo " --end-time      Time in format 00:00:00"
+  echo " --h264Preset    Change preset from 'ultrafast' to something you like"
   echo "Output: infile.mp4"
   exit 1
 fi
 dryrun=false
-startframe=0
-endframe=0
+startsecond=0
+endfsecond=0
+h264Preset=medium
 
 while [[ $# -gt 1 ]]
 do
@@ -30,20 +43,24 @@ case $key in
     dryrun=true
     shift
     ;;
-    --start-frame=*)
-    startframe="${key#*=}"
+    --start-second=*)
+    startsecond="${key#*=}"
     shift
     ;;
-    --end-frame=*)
-    endframe="${key#*=}"
+    --end-second=*)
+    endsecond="${key#*=}"
     shift
     ;;
     --start-time=*)
-    startframe=$(echo "${key#*=}" | awk -F: '{ print ($1 * 3600) + ($2 * 60) + $3 }')
+    startsecond=$(echo "${key#*=}" | awk -F: '{ print ($1 * 3600) + ($2 * 60) + $3 }')
     shift
     ;;
-    --stop-time=*)
-    endframe=$(echo "${key#*=}" | awk -F: '{ print ($1 * 3600) + ($2 * 60) + $3 }')
+    --end-time=*)
+    endsecond=$(echo "${key#*=}" | awk -F: '{ print ($1 * 3600) + ($2 * 60) + $3 }')
+    shift
+    ;;
+    --h264Preset=*)
+    h264Preset="${key#*=}"
     shift
     ;;
     *)
@@ -66,8 +83,7 @@ for audioStream in $(seq 1 $numberOfAudioStreams)
 do
   internalASNB=$(($audioStream-1))
   streamCodec=`$ffprobePath -v error -select_streams a:$internalASNB -show_entries stream=codec_name -of json=c=0 "$filename" | jq -r '.streams[] | "\(.codec_name)"'`
-  echo "STREAM CODEC: $streamCodec"
-
+  
   if [ "$streamCodec" == "ac3" ] || [ "$streamCodec" == "mp2" ]; then
     audio="$audio -acodec aac -strict experimental -map a:$internalASNB"
   fi
@@ -77,27 +93,28 @@ for subtitleStream in $(seq 1 $numberOfSubtitleStreams)
 do
   internalSubtitleStream=$(($subtitleStream-1))
   streamCodec=`$ffprobePath -v error -select_streams s:$internalSubtitleStream -show_entries stream=codec_name -of json=c=0 "$filename" | jq -r '.streams[] | "\(.codec_name)"'`
-  echo "$ffprobePath -v error -select_streams s:$internalSubtitleStream -show_entries stream=codec_name -of json=c=0 \"$filename\" | jq -r '.streams[] | \"\(.codec_name)\"\'"
-  echo "$steamCodec"
+  echo "$ffprobePath -v error -select_streams s:$internalSubtitleStream -show_entries stream=codec_name -of json=c=0 \"$filename\" | jq -r '.streams[] | \"\(.codec_name)\"'"
+  echo "$streamCodec"
 
   if [ "$streamCodec" == "srt" ]; then
     subtitle="$subtitle -scodec mov_text -map s:$internalSubtitleStream"
-  else
+  elif [ "$streamCodec" == "dvbsub" ]; then
     subtitle="$subtitle -scodec dvdsub -map s:$internalSubtitleStream -s $resolution"
   fi
+  echo "$subtitle"
 done
 
-duration=`echo "$endframe" "$startframe" | awk  '{printf "%f", $1 - $2}'`
+duration=`echo "$endsecond" "$startsecond" | awk  '{printf "%f", $1 - $2}'`
 
 startEnd=""
 if [ $(echo "$duration > 0"|bc) -eq 1 ]; then
-  startEnd="-ss $startframe -t $duration"
+  startEnd="-ss $startsecond -t $duration"
 fi
 echo "avconv -i \"$filename\" -f ffmetadata -y \"$filename.txt\""
-echo "avconv -canvas_size $resolution -threads auto -i \"$filename\" -i \"$filename.txt\" -map_metadata 1 $startEnd -vcodec libx264 -map v:0 -preset slow -tune film -profile:v high -level 41 $audio $subtitle -y \"$filename.mp4\""
+echo "avconv -canvas_size $resolution -threads auto $startEnd -i \"$filename\" -i \"$filename.txt\" -map_metadata 1 -vcodec libx264 -map v:0 -preset $h264Preset -tune film -profile:v high -level 41 $audio $subtitle -y \"$filename.mp4\""
 if ! $dryrun; then
   avconv -i "$filename" -f ffmetadata -y "$filename.txt"
-  avconv -canvas_size $resolution -threads auto -i "$filename" -i "$filename.txt" -map_metadata 1 $startEnd -vcodec libx264 -map v:0 -preset slow -tune film -profile:v high -level 41 $audio $subtitle -y "$filename.mp4"
+  avconv -canvas_size $resolution -threads auto $startEnd -i "$filename" -i "$filename.txt" -map_metadata 1 -vcodec libx264 -map v:0 -preset $h264Preset -tune film -profile:v high -level 41 $audio $subtitle -y "$filename.mp4"
 fi
 
 echo "------------"
