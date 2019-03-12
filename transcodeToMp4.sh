@@ -6,11 +6,11 @@ unset LD_LIBRARY_PATH
 exitcode=0
 
 ffmpegPath="ffmpeg"
-ffprobePath="avprobe"
+ffprobePath="ffprobe"
 
 command -v $ffmpegPath >/dev/null 2>&1 || { echo >&2 "I require $ffmpegPath but it's not installed.  Aborting."; exit 1; }
 command -v $ffprobePath >/dev/null 2>&1 || { echo >&2 "I require $ffprobePath but it's not installed.  Aborting."; exit 1; }
-command -v jq >/dev/null 2>&1 || { echo >&2 "I require foo bujq but's not installed.  Aborting."; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo >&2 "I require jq but it's not installed.  Aborting."; exit 1; }
 command -v bc >/dev/null 2>&1 || { echo >&2 "I require bc but it's not installed.  Aborting."; exit 1; }
 
 if [[ $# -lt 1 ]]; then
@@ -27,12 +27,14 @@ if [[ $# -lt 1 ]]; then
   echo " --start-time    Time in format 00:00:00"
   echo " --end-time      Time in format 00:00:00"
   echo " --h264Preset    Change preset from 'ultrafast' to something you like"
+  echo " --duration      Time in format 00:00:00"
   echo "Output: infile.mp4"
   exit 1
 fi
 dryrun=false
 startsecond=0
 endfsecond=0
+duration=0
 h264Preset=medium
 
 while [[ $# -gt 1 ]]
@@ -57,6 +59,11 @@ case $key in
     ;;
     --end-time=*)
     endsecond=$(echo "${key#*=}" | awk -F: '{ print ($1 * 3600) + ($2 * 60) + $3 }')
+    shift
+    ;;
+    --duration=*)
+    endsecond=0
+    duration=$(echo "${key#*=}" | awk -F: '{ print ($1 * 3600) + ($2 * 60) + $3 }')
     shift
     ;;
     --h264Preset=*)
@@ -104,18 +111,22 @@ do
   echo "$subtitle"
 done
 
-duration=`echo "$endsecond" "$startsecond" | awk  '{printf "%f", $1 - $2}'`
+if [ $(echo "$duration == 0"|bc) -eq 1 ]; then
+   duration=`echo "$endsecond" "$startsecond" | awk  '{printf "%f", $1 - $2}'`
+fi
 
 startEnd=""
 if [ $(echo "$duration > 0"|bc) -eq 1 ]; then
   startEnd="-ss $startsecond -t $duration"
 fi
-echo "avconv -i \"$filename\" -f ffmetadata -y \"$filename.txt\""
-echo "avconv -canvas_size $resolution -threads auto $startEnd -i \"$filename\" -i \"$filename.txt\" -map_metadata 1 -vcodec libx264 -map v:0 -preset $h264Preset -tune film -profile:v high -level 41 $audio $subtitle -y \"$filename.mp4\""
+echo "$ffmpegPath -i \"$filename\" -f ffmetadata -y \"$filename.txt\""
+echo "$ffmpegPath -canvas_size $resolution -threads auto $startEnd -i \"$filename\" -i \"$filename.txt\" -map_metadata 1 -vcodec .... -map v:0 -preset slow .....  -profile:v high -level 41 $audio $subtitle -y \"$filename.mp4\""
 if ! $dryrun; then
-  avconv -i "$filename" -f ffmetadata -y "$filename.txt"
-  avconv -canvas_size $resolution -threads auto $startEnd -i "$filename" -i "$filename.txt" -map_metadata 1 -vcodec libx264 -map v:0 -preset $h264Preset -tune film -profile:v high -level 41 $audio $subtitle -y "$filename.mp4"
+  $ffmpegPath -i "$filename" -f ffmetadata -y "$filename.txt"
+  $ffmpegPath -init_hw_device vaapi=foo:/dev/dri/renderD128 -hwaccel vaapi -hwaccel_output_format vaapi -hwaccel_device foo -canvas_size $resolution $startEnd -i "$filename" -i "$filename.txt" -map_metadata 1 -filter_hw_device foo -vf 'deinterlace_vaapi,hwupload' -vcodec h264_vaapi -map v:0 -preset slow -profile:v high -level 4.1 -qp 22 $audio $subtitle -y "$filename.mp4"
 fi
 
 echo "------------"
 echo ""
+
+
